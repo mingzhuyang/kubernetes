@@ -780,10 +780,16 @@ func podName(pod *v1.Pod) string {
 	return pod.Namespace + "/" + pod.Name
 }
 
-// PodFitsResources checks if a node has sufficient resources, such as cpu, memory, gpu, opaque int resources etc to run a pod.
+// PodFitsResources is a wrapper around PodFitsResourcesPredicate that implements FitPredicate interface.
+// TODO(#85822): remove this function once predicate registration logic is deleted.
+func PodFitsResources(pod *v1.Pod, _ Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+	return PodFitsResourcesPredicate(pod, nil, nil, nodeInfo)
+}
+
+// PodFitsResourcesPredicate checks if a node has sufficient resources, such as cpu, memory, gpu, opaque int resources etc to run a pod.
 // First return value indicates whether a node has sufficient resources to run a pod while the second return value indicates the
-// predicate failure reasons if the node has insufficient resources to run the pod.
-func PodFitsResources(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+// predicate failure reasons if the node has insufficient resources to run the pod
+func PodFitsResourcesPredicate(pod *v1.Pod, podRequest *schedulernodeinfo.Resource, ignoredExtendedResources sets.String, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return false, nil, fmt.Errorf("node not found")
@@ -795,17 +801,11 @@ func PodFitsResources(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.No
 		predicateFails = append(predicateFails, NewInsufficientResourceError(v1.ResourcePods, 1, int64(len(nodeInfo.Pods())), int64(allowedPodNumber)))
 	}
 
-	// No extended resources should be ignored by default.
-	ignoredExtendedResources := sets.NewString()
+	if ignoredExtendedResources == nil {
+		ignoredExtendedResources = sets.NewString()
+	}
 
-	var podRequest *schedulernodeinfo.Resource
-	if predicateMeta, ok := meta.(*predicateMetadata); ok && predicateMeta.podFitsResourcesMetadata != nil {
-		podRequest = predicateMeta.podFitsResourcesMetadata.podRequest
-		if predicateMeta.podFitsResourcesMetadata.ignoredExtendedResources != nil {
-			ignoredExtendedResources = predicateMeta.podFitsResourcesMetadata.ignoredExtendedResources
-		}
-	} else {
-		// We couldn't parse metadata - fallback to computing it.
+	if podRequest == nil {
 		podRequest = GetResourceRequest(pod)
 	}
 	if podRequest.MilliCPU == 0 &&
@@ -839,13 +839,11 @@ func PodFitsResources(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.No
 		}
 	}
 
-	if klog.V(10) {
-		if len(predicateFails) == 0 {
-			// We explicitly don't do klog.V(10).Infof() to avoid computing all the parameters if this is
-			// not logged. There is visible performance gain from it.
-			klog.Infof("Schedule Pod %+v on Node %+v is allowed, Node is running only %v out of %v Pods.",
-				podName(pod), node.Name, len(nodeInfo.Pods()), allowedPodNumber)
-		}
+	if klog.V(10) && len(predicateFails) == 0 {
+		// We explicitly don't do klog.V(10).Infof() to avoid computing all the parameters if this is
+		// not logged. There is visible performance gain from it.
+		klog.Infof("Schedule Pod %+v on Node %+v is allowed, Node is running only %v out of %v Pods.",
+			podName(pod), node.Name, len(nodeInfo.Pods()), allowedPodNumber)
 	}
 	return len(predicateFails) == 0, predicateFails, nil
 }
@@ -987,123 +985,18 @@ func (n *NodeLabelChecker) CheckNodeLabelPresence(pod *v1.Pod, meta Metadata, no
 	return false, []PredicateFailureReason{ErrNodeLabelPresenceViolated}, nil
 }
 
-// ServiceAffinity defines a struct used for creating service affinity predicates.
-type ServiceAffinity struct {
-	nodeInfoLister schedulerlisters.NodeInfoLister
-	podLister      schedulerlisters.PodLister
-	serviceLister  corelisters.ServiceLister
-	labels         []string
+// PodFitsHostPorts is a wrapper around PodFitsHostPortsPredicate. This is needed until
+// we are able to get rid of the FitPredicate function signature.
+// TODO(#85822): remove this function once predicate registration logic is deleted.
+func PodFitsHostPorts(pod *v1.Pod, _ Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+	return PodFitsHostPortsPredicate(pod, nil, nodeInfo)
 }
 
-// serviceAffinityMetadataProducer should be run once by the scheduler before looping through the Predicate.  It is a helper function that
-// only should be referenced by NewServiceAffinityPredicate.
-func (s *ServiceAffinity) serviceAffinityMetadataProducer(pm *predicateMetadata) {
-	if pm.pod == nil {
-		klog.Errorf("Cannot precompute service affinity, a pod is required to calculate service affinity.")
-		return
-	}
-	// Store services which match the pod.
-	matchingPodServices, err := schedulerlisters.GetPodServices(s.serviceLister, pm.pod)
-	if err != nil {
-		klog.Errorf("Error precomputing service affinity: could not list services: %v", err)
-	}
-	selector := CreateSelectorFromLabels(pm.pod.Labels)
-	allMatches, err := s.podLister.List(selector)
-	if err != nil {
-		klog.Errorf("Error precomputing service affinity: could not list pods: %v", err)
-	}
-
-	// consider only the pods that belong to the same namespace
-	matchingPodList := FilterPodsByNamespace(allMatches, pm.pod.Namespace)
-	pm.serviceAffinityMetadata = &serviceAffinityMetadata{
-		matchingPodList:     matchingPodList,
-		matchingPodServices: matchingPodServices,
-	}
-}
-
-// NewServiceAffinityPredicate creates a ServiceAffinity.
-func NewServiceAffinityPredicate(nodeInfoLister schedulerlisters.NodeInfoLister, podLister schedulerlisters.PodLister, serviceLister corelisters.ServiceLister, labels []string) (FitPredicate, predicateMetadataProducer) {
-	affinity := &ServiceAffinity{
-		nodeInfoLister: nodeInfoLister,
-		podLister:      podLister,
-		serviceLister:  serviceLister,
-		labels:         labels,
-	}
-	return affinity.checkServiceAffinity, affinity.serviceAffinityMetadataProducer
-}
-
-// checkServiceAffinity is a predicate which matches nodes in such a way to force that
-// ServiceAffinity.labels are homogeneous for pods that are scheduled to a node.
-// (i.e. it returns true IFF this pod can be added to this node such that all other pods in
-// the same service are running on nodes with the exact same ServiceAffinity.label values).
-//
-// For example:
-// If the first pod of a service was scheduled to a node with label "region=foo",
-// all the other subsequent pods belong to the same service will be schedule on
-// nodes with the same "region=foo" label.
-//
-// Details:
-//
-// If (the svc affinity labels are not a subset of pod's label selectors )
-// 	The pod has all information necessary to check affinity, the pod's label selector is sufficient to calculate
-// 	the match.
-// Otherwise:
-// 	Create an "implicit selector" which guarantees pods will land on nodes with similar values
-// 	for the affinity labels.
-//
-// 	To do this, we "reverse engineer" a selector by introspecting existing pods running under the same service+namespace.
-//	These backfilled labels in the selector "L" are defined like so:
-// 		- L is a label that the ServiceAffinity object needs as a matching constraint.
-// 		- L is not defined in the pod itself already.
-// 		- and SOME pod, from a service, in the same namespace, ALREADY scheduled onto a node, has a matching value.
-//
-// WARNING: This Predicate is NOT guaranteed to work if some of the predicateMetadata data isn't precomputed...
-// For that reason it is not exported, i.e. it is highly coupled to the implementation of the FitPredicate construction.
-func (s *ServiceAffinity) checkServiceAffinity(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
-	var services []*v1.Service
-	var pods []*v1.Pod
-	if pm, ok := meta.(*predicateMetadata); ok && pm.serviceAffinityMetadata != nil && (pm.serviceAffinityMetadata.matchingPodList != nil || pm.serviceAffinityMetadata.matchingPodServices != nil) {
-		services = pm.serviceAffinityMetadata.matchingPodServices
-		pods = pm.serviceAffinityMetadata.matchingPodList
-	} else {
-		// Make the predicate resilient in case metadata is missing.
-		pm = &predicateMetadata{pod: pod}
-		s.serviceAffinityMetadataProducer(pm)
-		pods, services = pm.serviceAffinityMetadata.matchingPodList, pm.serviceAffinityMetadata.matchingPodServices
-	}
-	filteredPods := nodeInfo.FilterOutPods(pods)
-	node := nodeInfo.Node()
-	if node == nil {
-		return false, nil, fmt.Errorf("node not found")
-	}
-	// check if the pod being scheduled has the affinity labels specified in its NodeSelector
-	affinityLabels := FindLabelsInSet(s.labels, labels.Set(pod.Spec.NodeSelector))
-	// Step 1: If we don't have all constraints, introspect nodes to find the missing constraints.
-	if len(s.labels) > len(affinityLabels) {
-		if len(services) > 0 {
-			if len(filteredPods) > 0 {
-				nodeWithAffinityLabels, err := s.nodeInfoLister.Get(filteredPods[0].Spec.NodeName)
-				if err != nil {
-					return false, nil, err
-				}
-				AddUnsetLabelsToMap(affinityLabels, s.labels, labels.Set(nodeWithAffinityLabels.Node().Labels))
-			}
-		}
-	}
-	// Step 2: Finally complete the affinity predicate based on whatever set of predicates we were able to find.
-	if CreateSelectorFromLabels(affinityLabels).Matches(labels.Set(node.Labels)) {
-		return true, nil, nil
-	}
-	return false, []PredicateFailureReason{ErrServiceAffinityViolated}, nil
-}
-
-// PodFitsHostPorts checks if a node has free ports for the requested pod ports.
-func PodFitsHostPorts(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
-	var wantPorts []*v1.ContainerPort
-	if predicateMeta, ok := meta.(*predicateMetadata); ok && predicateMeta.podFitsHostPortsMetadata != nil {
-		wantPorts = predicateMeta.podFitsHostPortsMetadata.podPorts
-	} else {
-		// We couldn't parse metadata - fallback to computing it.
+// PodFitsHostPortsPredicate checks if a node has free ports for the requested pod ports.
+func PodFitsHostPortsPredicate(pod *v1.Pod, meta []*v1.ContainerPort, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+	wantPorts := meta
+	if wantPorts == nil {
+		// Fallback to computing it.
 		wantPorts = schedutil.GetContainerPorts(pod)
 	}
 	if len(wantPorts) == 0 {
@@ -1139,43 +1032,11 @@ func haveOverlap(a1, a2 []string) bool {
 	return false
 }
 
-// GeneralPredicates checks whether noncriticalPredicates and EssentialPredicates pass. noncriticalPredicates are the predicates
-// that only non-critical pods need and EssentialPredicates are the predicates that all pods, including critical pods, need.
+// GeneralPredicates checks a group of predicates that the kubelet cares about.
+// DEPRECATED: this exist only because kubelet uses it. We should change kubelet to execute the individual predicates it requires.
 func GeneralPredicates(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
 	var predicateFails []PredicateFailureReason
-	for _, predicate := range []FitPredicate{noncriticalPredicates, EssentialPredicates} {
-		fit, reasons, err := predicate(pod, meta, nodeInfo)
-		if err != nil {
-			return false, predicateFails, err
-		}
-		if !fit {
-			predicateFails = append(predicateFails, reasons...)
-		}
-	}
-
-	return len(predicateFails) == 0, predicateFails, nil
-}
-
-// noncriticalPredicates are the predicates that only non-critical pods need.
-func noncriticalPredicates(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
-	var predicateFails []PredicateFailureReason
-	fit, reasons, err := PodFitsResources(pod, meta, nodeInfo)
-	if err != nil {
-		return false, predicateFails, err
-	}
-	if !fit {
-		predicateFails = append(predicateFails, reasons...)
-	}
-
-	return len(predicateFails) == 0, predicateFails, nil
-}
-
-// EssentialPredicates are the predicates that all pods, including critical pods, need.
-func EssentialPredicates(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
-	var predicateFails []PredicateFailureReason
-	// TODO: PodFitsHostPorts is essential for now, but kubelet should ideally
-	//       preempt pods to free up host ports too
-	for _, predicate := range []FitPredicate{PodFitsHost, PodFitsHostPorts, PodMatchNodeSelector} {
+	for _, predicate := range []FitPredicate{PodFitsResources, PodFitsHost, PodFitsHostPorts, PodMatchNodeSelector} {
 		fit, reasons, err := predicate(pod, meta, nodeInfo)
 		if err != nil {
 			return false, predicateFails, err
@@ -1194,23 +1055,30 @@ type PodAffinityChecker struct {
 	podLister      schedulerlisters.PodLister
 }
 
+// NewPodAffinityChecker returns a PodAffinityChecker.
+func NewPodAffinityChecker(sharedLister schedulerlisters.SharedLister) *PodAffinityChecker {
+	return &PodAffinityChecker{
+		nodeInfoLister: sharedLister.NodeInfos(),
+		podLister:      sharedLister.Pods(),
+	}
+}
+
 // NewPodAffinityPredicate creates a PodAffinityChecker.
 func NewPodAffinityPredicate(nodeInfoLister schedulerlisters.NodeInfoLister, podLister schedulerlisters.PodLister) FitPredicate {
-	checker := &PodAffinityChecker{
-		nodeInfoLister: nodeInfoLister,
-		podLister:      podLister,
+	return func(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+		return false, nil, fmt.Errorf("This function should never be called")
 	}
-	return checker.InterPodAffinityMatches
 }
 
 // InterPodAffinityMatches checks if a pod can be scheduled on the specified node with pod affinity/anti-affinity configuration.
 // First return value indicates whether a pod can be scheduled on the specified node while the second return value indicates the
 // predicate failure reasons if the pod cannot be scheduled on the specified node.
-func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta *PodAffinityMetadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return false, nil, fmt.Errorf("node not found")
 	}
+
 	if failedPredicates, error := c.satisfiesExistingPodsAntiAffinity(pod, meta, nodeInfo); failedPredicates != nil {
 		failedPredicates := append([]PredicateFailureReason{ErrPodAffinityNotMatch}, failedPredicates)
 		return false, failedPredicates, error
@@ -1341,14 +1209,14 @@ func (c *PodAffinityChecker) getMatchingAntiAffinityTopologyPairsOfPods(pod *v1.
 
 // Checks if scheduling the pod onto this node would break any anti-affinity
 // terms indicated by the existing pods.
-func (c *PodAffinityChecker) satisfiesExistingPodsAntiAffinity(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (PredicateFailureReason, error) {
+func (c *PodAffinityChecker) satisfiesExistingPodsAntiAffinity(pod *v1.Pod, meta *PodAffinityMetadata, nodeInfo *schedulernodeinfo.NodeInfo) (PredicateFailureReason, error) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return ErrExistingPodsAntiAffinityRulesNotMatch, fmt.Errorf("node not found")
 	}
 	var topologyMap topologyToMatchedTermCount
-	if predicateMeta, ok := meta.(*predicateMetadata); ok {
-		topologyMap = predicateMeta.podAffinityMetadata.topologyToMatchedExistingAntiAffinityTerms
+	if meta != nil {
+		topologyMap = meta.topologyToMatchedExistingAntiAffinityTerms
 	} else {
 		// Filter out pods whose nodeName is equal to nodeInfo.node.Name, but are not
 		// present in nodeInfo. Pods on other nodes pass the filter.
@@ -1416,15 +1284,15 @@ func (c *PodAffinityChecker) nodeMatchesAnyTopologyTerm(pod *v1.Pod, topologyPai
 
 // satisfiesPodsAffinityAntiAffinity checks if scheduling the pod onto this node would break any term of this pod.
 func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod,
-	meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo,
+	predicateMeta *PodAffinityMetadata, nodeInfo *schedulernodeinfo.NodeInfo,
 	affinity *v1.Affinity) (PredicateFailureReason, error) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return ErrPodAffinityRulesNotMatch, fmt.Errorf("node not found")
 	}
-	if predicateMeta, ok := meta.(*predicateMetadata); ok {
+	if predicateMeta != nil {
 		// Check all affinity terms.
-		topologyToMatchedAffinityTerms := predicateMeta.podAffinityMetadata.topologyToMatchedAffinityTerms
+		topologyToMatchedAffinityTerms := predicateMeta.topologyToMatchedAffinityTerms
 		if affinityTerms := GetPodAffinityTerms(affinity.PodAffinity); len(affinityTerms) > 0 {
 			matchExists := c.nodeMatchesAllTopologyTerms(pod, topologyToMatchedAffinityTerms, nodeInfo, affinityTerms)
 			if !matchExists {
@@ -1441,7 +1309,7 @@ func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod,
 		}
 
 		// Check all anti-affinity terms.
-		topologyToMatchedAntiAffinityTerms := predicateMeta.podAffinityMetadata.topologyToMatchedAntiAffinityTerms
+		topologyToMatchedAntiAffinityTerms := predicateMeta.topologyToMatchedAntiAffinityTerms
 		if antiAffinityTerms := GetPodAntiAffinityTerms(affinity.PodAntiAffinity); len(antiAffinityTerms) > 0 {
 			matchExists := c.nodeMatchesAnyTopologyTerm(pod, topologyToMatchedAntiAffinityTerms, nodeInfo, antiAffinityTerms)
 			if matchExists {
@@ -1635,28 +1503,33 @@ func (c *VolumeBindingChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *s
 	return true, nil, nil
 }
 
-// EvenPodsSpreadPredicate checks if a pod can be scheduled on a node which satisfies
-// its topologySpreadConstraints.
+// EvenPodsSpreadPredicate is the legacy function using old path of metadata.
+// DEPRECATED
 func EvenPodsSpreadPredicate(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
+	return false, nil, fmt.Errorf("this function should never be called")
+}
+
+// PodTopologySpreadPredicate checks if a pod can be scheduled on a node which satisfies
+// its topologySpreadConstraints.
+func PodTopologySpreadPredicate(pod *v1.Pod, meta *PodTopologySpreadMetadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return false, nil, fmt.Errorf("node not found")
 	}
 
-	var epsMeta *evenPodsSpreadMetadata
-	if predicateMeta, ok := meta.(*predicateMetadata); ok {
-		epsMeta = predicateMeta.evenPodsSpreadMetadata
-	} else { // We don't have precomputed metadata. We have to follow a slow path to check spread constraints.
-		// TODO(autoscaler): get it implemented
-		return false, nil, errors.New("metadata not pre-computed for EvenPodsSpreadPredicate")
+	// nil meta is illegal.
+	if meta == nil {
+		// TODO(autoscaler): get it implemented.
+		return false, nil, errors.New("metadata not pre-computed for PodTopologySpreadPredicate")
 	}
 
-	if epsMeta == nil || len(epsMeta.tpPairToMatchNum) == 0 || len(epsMeta.constraints) == 0 {
+	// However, "empty" meta is legit which tolerates every toSchedule Pod.
+	if len(meta.tpPairToMatchNum) == 0 || len(meta.constraints) == 0 {
 		return true, nil, nil
 	}
 
 	podLabelSet := labels.Set(pod.Labels)
-	for _, c := range epsMeta.constraints {
+	for _, c := range meta.constraints {
 		tpKey := c.topologyKey
 		tpVal, ok := node.Labels[c.topologyKey]
 		if !ok {
@@ -1670,16 +1543,16 @@ func EvenPodsSpreadPredicate(pod *v1.Pod, meta Metadata, nodeInfo *schedulernode
 		}
 
 		pair := topologyPair{key: tpKey, value: tpVal}
-		paths, ok := epsMeta.tpKeyToCriticalPaths[tpKey]
+		paths, ok := meta.tpKeyToCriticalPaths[tpKey]
 		if !ok {
 			// error which should not happen
-			klog.Errorf("internal error: get paths from key %q of %#v", tpKey, epsMeta.tpKeyToCriticalPaths)
+			klog.Errorf("internal error: get paths from key %q of %#v", tpKey, meta.tpKeyToCriticalPaths)
 			continue
 		}
 		// judging criteria:
 		// 'existing matching num' + 'if self-match (1 or 0)' - 'global min matching num' <= 'maxSkew'
 		minMatchNum := paths[0].matchNum
-		matchNum := epsMeta.tpPairToMatchNum[pair]
+		matchNum := meta.tpPairToMatchNum[pair]
 		skew := matchNum + selfMatchNum - minMatchNum
 		if skew > c.maxSkew {
 			klog.V(5).Infof("node '%s' failed spreadConstraint[%s]: matchNum(%d) + selfMatchNum(%d) - minMatchNum(%d) > maxSkew(%d)", node.Name, tpKey, matchNum, selfMatchNum, minMatchNum, c.maxSkew)

@@ -167,9 +167,7 @@ func (es mockScheduler) Schedule(ctx context.Context, state *framework.CycleStat
 func (es mockScheduler) Predicates() map[string]predicates.FitPredicate {
 	return nil
 }
-func (es mockScheduler) Prioritizers() []priorities.PriorityConfig {
-	return nil
-}
+
 func (es mockScheduler) Extenders() []algorithm.SchedulerExtender {
 	return nil
 }
@@ -177,6 +175,10 @@ func (es mockScheduler) Preempt(ctx context.Context, state *framework.CycleState
 	return nil, nil, nil, nil
 }
 func (es mockScheduler) Snapshot() error {
+	return nil
+
+}
+func (es mockScheduler) Framework() framework.Framework {
 	return nil
 
 }
@@ -566,7 +568,7 @@ func TestSchedulerErrorWithLongBinding(t *testing.T) {
 // queuedPodStore: pods queued before processing.
 // cache: scheduler cache that might contain assumed pods.
 func setupTestSchedulerWithOnePodOnNode(t *testing.T, queuedPodStore *clientcache.FIFO, scache internalcache.Cache,
-	informerFactory informers.SharedInformerFactory, stop chan struct{}, f st.RegisterFilterPluginFunc, pod *v1.Pod, node *v1.Node) (*Scheduler, chan *v1.Binding, chan error) {
+	informerFactory informers.SharedInformerFactory, stop chan struct{}, f st.RegisterPluginFunc, pod *v1.Pod, node *v1.Node) (*Scheduler, chan *v1.Binding, chan error) {
 
 	scheduler, bindingChan, errChan := setupTestScheduler(queuedPodStore, scache, informerFactory, f, nil)
 
@@ -677,7 +679,7 @@ func TestSchedulerFailedSchedulingReasons(t *testing.T) {
 
 // queuedPodStore: pods queued before processing.
 // scache: scheduler cache that might contain assumed pods.
-func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, f st.RegisterFilterPluginFunc, recorder events.EventRecorder) (*Scheduler, chan *v1.Binding, chan error) {
+func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, f st.RegisterPluginFunc, recorder events.EventRecorder) (*Scheduler, chan *v1.Binding, chan error) {
 	registry := framework.Registry{}
 	plugins := &schedulerapi.Plugins{
 		Filter: &schedulerapi.PluginSet{},
@@ -690,7 +692,6 @@ func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.C
 		internalqueue.NewSchedulingQueue(nil),
 		nil,
 		predicates.EmptyMetadataProducer,
-		[]priorities.PriorityConfig{},
 		priorities.EmptyMetadataProducer,
 		nodeinfosnapshot.NewEmptySnapshot(),
 		fwk,
@@ -735,7 +736,7 @@ func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.C
 	return sched, bindingChan, errChan
 }
 
-func setupTestSchedulerLongBindingWithRetry(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, f st.RegisterFilterPluginFunc, stop chan struct{}, bindingTime time.Duration) (*Scheduler, chan *v1.Binding) {
+func setupTestSchedulerLongBindingWithRetry(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, f st.RegisterPluginFunc, stop chan struct{}, bindingTime time.Duration) (*Scheduler, chan *v1.Binding) {
 	registry := framework.Registry{}
 	plugins := &schedulerapi.Plugins{
 		Filter: &schedulerapi.PluginSet{},
@@ -749,7 +750,6 @@ func setupTestSchedulerLongBindingWithRetry(queuedPodStore *clientcache.FIFO, sc
 		queue,
 		nil,
 		predicates.EmptyMetadataProducer,
-		[]priorities.PriorityConfig{},
 		priorities.EmptyMetadataProducer,
 		nodeinfosnapshot.NewEmptySnapshot(),
 		fwk,
@@ -1002,9 +1002,8 @@ func TestInitPolicyFromFile(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	for i, test := range []struct {
-		policy               string
-		expectedPredicates   sets.String
-		expectedPrioritizers sets.String
+		policy             string
+		expectedPredicates sets.String
 	}{
 		// Test json format policy file
 		{
@@ -1024,10 +1023,6 @@ func TestInitPolicyFromFile(t *testing.T) {
 				"PredicateOne",
 				"PredicateTwo",
 			),
-			expectedPrioritizers: sets.NewString(
-				"PriorityOne",
-				"PriorityTwo",
-			),
 		},
 		// Test yaml format policy file
 		{
@@ -1045,10 +1040,6 @@ priorities:
 			expectedPredicates: sets.NewString(
 				"PredicateOne",
 				"PredicateTwo",
-			),
-			expectedPrioritizers: sets.NewString(
-				"PriorityOne",
-				"PriorityTwo",
 			),
 		},
 	} {
@@ -1076,9 +1067,6 @@ priorities:
 		}
 		if !schedPredicates.Equal(test.expectedPredicates) {
 			t.Errorf("Expected predicates %v, got %v", test.expectedPredicates, schedPredicates)
-		}
-		if !schedPrioritizers.Equal(test.expectedPrioritizers) {
-			t.Errorf("Expected priority functions %v, got %v", test.expectedPrioritizers, schedPrioritizers)
 		}
 	}
 }

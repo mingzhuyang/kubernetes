@@ -33,7 +33,6 @@ import (
 	policy "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/errors"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1beta1"
 	"k8s.io/client-go/util/workqueue"
@@ -129,9 +128,6 @@ type ScheduleAlgorithm interface {
 	Predicates() map[string]predicates.FitPredicate
 	// Prioritizers returns a slice of priority config. This is exposed for
 	// testing.
-	Prioritizers() []priorities.PriorityConfig
-	// Extenders returns a slice of extender config. This is exposed for
-	// testing.
 	Extenders() []algorithm.SchedulerExtender
 	// GetPredicateMetadataProducer returns the predicate metadata producer. This is needed
 	// for cluster autoscaler integration.
@@ -141,6 +137,9 @@ type ScheduleAlgorithm interface {
 	// for cluster autoscaler integration.
 	// TODO(#85691): remove this once CA migrates to creating a Framework instead of a full scheduler.
 	Snapshot() error
+	// Framework returns the scheduler framework instance. This is needed  for cluster autoscaler integration.
+	// TODO(#85691): remove this once CA migrates to creating a Framework instead of a full scheduler.
+	Framework() framework.Framework
 }
 
 // ScheduleResult represents the result of one pod scheduled. It will contain
@@ -174,14 +173,20 @@ type genericScheduler struct {
 	nextStartNodeIndex       int
 }
 
-// snapshot snapshots scheduler cache and node infos for all fit and priority
+// Snapshot snapshots scheduler cache and node infos for all fit and priority
 // functions.
 func (g *genericScheduler) Snapshot() error {
 	// Used for all fit and priority funcs.
 	return g.cache.UpdateNodeInfoSnapshot(g.nodeInfoSnapshot)
 }
 
-// GetPredicateMetadataProducer returns the predicate metadata producer. This is needed
+// Framework returns the framework instance.
+func (g *genericScheduler) Framework() framework.Framework {
+	// Used for all fit and priority funcs.
+	return g.framework
+}
+
+// PredicateMetadataProducer returns the predicate metadata producer. This is needed
 // for cluster autoscaler integration.
 func (g *genericScheduler) PredicateMetadataProducer() predicates.MetadataProducer {
 	return g.predicateMetaProducer
@@ -570,7 +575,7 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 				if _, found := failedPredicateMap[failedNodeName]; !found {
 					failedPredicateMap[failedNodeName] = []predicates.PredicateFailureReason{}
 				}
-				failedPredicateMap[failedNodeName] = append(failedPredicateMap[failedNodeName], predicates.NewFailureReason(failedMsg))
+				failedPredicateMap[failedNodeName] = append(failedPredicateMap[failedNodeName], predicates.NewPredicateFailureError(extender.Name(), failedMsg))
 			}
 			filtered = filteredList
 			if len(filtered) == 0 {
@@ -684,11 +689,10 @@ func (g *genericScheduler) podFitsOnNode(
 	return len(failedPredicates) == 0 && status.IsSuccess(), failedPredicates, status, nil
 }
 
-// prioritizeNodes prioritizes the nodes by running the individual priority functions in parallel.
-// Each priority function is expected to set a score of 0-10
-// 0 is the lowest priority score (least preferred node) and 10 is the highest
-// Each priority function can also have its own weight
-// The node scores returned by the priority function are multiplied by the weights to get weighted scores
+// prioritizeNodes prioritizes the nodes by running the score plugins,
+// which return a score for each node from the call to RunScorePlugins().
+// The scores from each plugin are added together to make the score for that node, then
+// any extenders are run as well.
 // All scores are finally combined (added) to get the total weighted scores of all nodes
 func (g *genericScheduler) prioritizeNodes(
 	ctx context.Context,
@@ -699,7 +703,7 @@ func (g *genericScheduler) prioritizeNodes(
 ) (framework.NodeScoreList, error) {
 	// If no priority configs are provided, then all nodes will have a score of one.
 	// This is required to generate the priority list in the required format
-	if len(g.prioritizers) == 0 && len(g.extenders) == 0 && !g.framework.HasScorePlugins() {
+	if len(g.extenders) == 0 && !g.framework.HasScorePlugins() {
 		result := make(framework.NodeScoreList, 0, len(nodes))
 		for i := range nodes {
 			result = append(result, framework.NodeScore{
@@ -708,62 +712,6 @@ func (g *genericScheduler) prioritizeNodes(
 			})
 		}
 		return result, nil
-	}
-
-	var (
-		mu   = sync.Mutex{}
-		wg   = sync.WaitGroup{}
-		errs []error
-	)
-	appendError := func(err error) {
-		mu.Lock()
-		defer mu.Unlock()
-		errs = append(errs, err)
-	}
-
-	results := make([]framework.NodeScoreList, len(g.prioritizers))
-
-	for i := range g.prioritizers {
-		results[i] = make(framework.NodeScoreList, len(nodes))
-	}
-
-	workqueue.ParallelizeUntil(context.TODO(), 16, len(nodes), func(index int) {
-		nodeInfo := g.nodeInfoSnapshot.NodeInfoMap[nodes[index].Name]
-		for i := range g.prioritizers {
-			var err error
-			results[i][index], err = g.prioritizers[i].Map(pod, meta, nodeInfo)
-			if err != nil {
-				appendError(err)
-				results[i][index].Name = nodes[index].Name
-			}
-		}
-	})
-
-	for i := range g.prioritizers {
-		if g.prioritizers[i].Reduce == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(index int) {
-			metrics.SchedulerGoroutines.WithLabelValues("prioritizing_mapreduce").Inc()
-			defer func() {
-				metrics.SchedulerGoroutines.WithLabelValues("prioritizing_mapreduce").Dec()
-				wg.Done()
-			}()
-			if err := g.prioritizers[index].Reduce(pod, meta, g.nodeInfoSnapshot, results[index]); err != nil {
-				appendError(err)
-			}
-			if klog.V(10) {
-				for _, hostPriority := range results[index] {
-					klog.Infof("%v -> %v: %v, Score: (%d)", util.GetPodFullName(pod), hostPriority.Name, g.prioritizers[index].Name, hostPriority.Score)
-				}
-			}
-		}(i)
-	}
-	// Wait for all computations to be finished.
-	wg.Wait()
-	if len(errs) != 0 {
-		return framework.NodeScoreList{}, errors.NewAggregate(errs)
 	}
 
 	// Run the Score plugins.
@@ -778,16 +726,14 @@ func (g *genericScheduler) prioritizeNodes(
 
 	for i := range nodes {
 		result = append(result, framework.NodeScore{Name: nodes[i].Name, Score: 0})
-		for j := range g.prioritizers {
-			result[i].Score += results[j][i].Score * g.prioritizers[j].Weight
-		}
-
 		for j := range scoresMap {
 			result[i].Score += scoresMap[j][i].Score
 		}
 	}
 
 	if len(g.extenders) != 0 && nodes != nil {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
 		combinedScores := make(map[string]int64, len(g.nodeInfoSnapshot.NodeInfoList))
 		for i := range g.extenders {
 			if !g.extenders[i].IsInterested(pod) {
@@ -1249,7 +1195,6 @@ func NewGenericScheduler(
 	podQueue internalqueue.SchedulingQueue,
 	predicates map[string]predicates.FitPredicate,
 	predicateMetaProducer predicates.MetadataProducer,
-	prioritizers []priorities.PriorityConfig,
 	priorityMetaProducer priorities.MetadataProducer,
 	nodeInfoSnapshot *nodeinfosnapshot.Snapshot,
 	framework framework.Framework,
@@ -1266,7 +1211,6 @@ func NewGenericScheduler(
 		schedulingQueue:          podQueue,
 		predicates:               predicates,
 		predicateMetaProducer:    predicateMetaProducer,
-		prioritizers:             prioritizers,
 		priorityMetaProducer:     priorityMetaProducer,
 		framework:                framework,
 		extenders:                extenders,

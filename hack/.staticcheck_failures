@@ -1,7 +1,5 @@
 cluster/images/etcd-version-monitor
 cluster/images/etcd/migrate
-cmd/kube-proxy/app
-cmd/linkcheck
 pkg/controller/daemon
 pkg/controller/deployment
 pkg/controller/disruption
@@ -31,7 +29,6 @@ pkg/registry/core/resourcequota/storage
 pkg/registry/core/service/ipallocator
 pkg/registry/core/service/portallocator
 pkg/registry/core/service/storage
-pkg/registry/extensions/controller/storage
 pkg/util/coverage
 pkg/util/ebtables
 pkg/util/ipconfig
@@ -66,7 +63,6 @@ test/e2e/apps
 test/e2e/autoscaling
 test/e2e/instrumentation/logging/stackdriver
 test/e2e/instrumentation/monitoring
-test/e2e/manifest
 test/images/agnhost/dns
 test/images/agnhost/inclusterclient
 test/images/agnhost/net/nat

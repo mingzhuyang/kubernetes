@@ -44,6 +44,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
 	"k8s.io/kubernetes/pkg/scheduler/core"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	cachedebugger "k8s.io/kubernetes/pkg/scheduler/internal/cache/debugger"
@@ -177,8 +178,8 @@ func (c *Configurator) CreateFromConfig(policy schedulerapi.Policy) (*Scheduler,
 
 	var extenders []algorithm.SchedulerExtender
 	if len(policy.Extenders) != 0 {
-		ignoredExtendedResources := sets.NewString()
 		var ignorableExtenders []algorithm.SchedulerExtender
+		var ignoredExtendedResources []string
 		for ii := range policy.Extenders {
 			klog.V(2).Infof("Creating extender with config %+v", policy.Extenders[ii])
 			extender, err := core.NewHTTPExtender(&policy.Extenders[ii])
@@ -192,13 +193,15 @@ func (c *Configurator) CreateFromConfig(policy schedulerapi.Policy) (*Scheduler,
 			}
 			for _, r := range policy.Extenders[ii].ManagedResources {
 				if r.IgnoredByScheduler {
-					ignoredExtendedResources.Insert(string(r.Name))
+					ignoredExtendedResources = append(ignoredExtendedResources, r.Name)
 				}
 			}
 		}
+		c.configProducerArgs.NodeResourcesFitArgs = &noderesources.FitArgs{
+			IgnoredResources: ignoredExtendedResources,
+		}
 		// place ignorable extenders to the tail of extenders
 		extenders = append(extenders, ignorableExtenders...)
-		predicates.RegisterPredicateMetadataProducerWithExtendedResourceOptions(ignoredExtendedResources)
 	}
 	// Providing HardPodAffinitySymmetricWeight in the policy config is the new and preferred way of providing the value.
 	// Give it higher precedence than scheduler CLI configuration when it is provided.
@@ -227,7 +230,7 @@ func (c *Configurator) CreateFromKeys(predicateKeys, priorityKeys sets.String, e
 		return nil, err
 	}
 
-	priorityConfigs, pluginsForPriorities, pluginConfigForPriorities, err := c.getPriorityConfigs(priorityKeys)
+	pluginsForPriorities, pluginConfigForPriorities, err := c.getPriorityConfigs(priorityKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +288,6 @@ func (c *Configurator) CreateFromKeys(predicateKeys, priorityKeys sets.String, e
 		podQueue,
 		predicateFuncs,
 		predicateMetaProducer,
-		priorityConfigs,
 		priorityMetaProducer,
 		c.nodeInfoSnapshot,
 		framework,
@@ -327,20 +329,20 @@ func getBinderFunc(client clientset.Interface, extenders []algorithm.SchedulerEx
 	}
 }
 
+// getPriorityConfigs
 // getPriorityConfigs returns priorities configuration: ones that will run as priorities and ones that will run
 // as framework plugins. Specifically, a priority will run as a framework plugin if a plugin config producer was
 // registered for that priority.
-func (c *Configurator) getPriorityConfigs(priorityKeys sets.String) ([]priorities.PriorityConfig, *schedulerapi.Plugins, []schedulerapi.PluginConfig, error) {
+func (c *Configurator) getPriorityConfigs(priorityKeys sets.String) (*schedulerapi.Plugins, []schedulerapi.PluginConfig, error) {
 	allPriorityConfigs, err := getPriorityFunctionConfigs(priorityKeys, c.algorithmFactoryArgs)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	if c.pluginConfigProducerRegistry == nil {
-		return allPriorityConfigs, nil, nil, nil
+		return nil, nil, nil
 	}
 
-	var priorityConfigs []priorities.PriorityConfig
 	var plugins schedulerapi.Plugins
 	var pluginConfig []schedulerapi.PluginConfig
 	frameworkConfigProducers := c.pluginConfigProducerRegistry.PriorityToConfigProducer
@@ -351,11 +353,9 @@ func (c *Configurator) getPriorityConfigs(priorityKeys sets.String) ([]prioritie
 			pl, pc := producer(args)
 			plugins.Append(&pl)
 			pluginConfig = append(pluginConfig, pc...)
-		} else {
-			priorityConfigs = append(priorityConfigs, p)
 		}
 	}
-	return priorityConfigs, &plugins, pluginConfig, nil
+	return &plugins, pluginConfig, nil
 }
 
 // getPredicateConfigs returns predicates configuration: ones that will run as fitPredicates and ones that will run
